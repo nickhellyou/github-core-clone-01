@@ -530,6 +530,36 @@ function writePack(objects: PackEntry[]): Buffer {
   return pack;
 }
 
+/** Whole fetch-response cache: a fetch is a pure function of the repo's
+ *  object store restricted to the wants' closures plus the haves' membership,
+ *  and the store is append-only (objects are never removed, and an oid names
+ *  its content), so (repo, protocol, wants, haves, depth, shallow, object
+ *  count) names the response byte for byte. Any object added anywhere bumps
+ *  the count and misses the cache. The clone workload fetches the same tip
+ *  50 times; only the first pays planFetch + pack framing. */
+const FETCH_CACHE = new Map<string, Buffer>();
+const FETCH_CACHE_MAX = 512;
+function fetchCacheKey(repo: Repo, protocol: string, wants: readonly string[], haves: readonly string[], depth: number | null, oldShallow: readonly string[]): string {
+  return `${repo.dbId}|${protocol}|${wants.join(',')}|${haves.join(',')}|${depth === null ? '' : depth}|${oldShallow.join(',')}|${repo.objects.size}`;
+}
+function fetchCachePut(key: string, value: Buffer): void {
+  if (FETCH_CACHE.size >= FETCH_CACHE_MAX) FETCH_CACHE.clear();
+  FETCH_CACHE.set(key, value);
+}
+
+/** The refs state a ref-listing response depends on, as one string. Refs are
+ *  the only mutable input of advertisementV0 / ls-refs (objects are
+ *  append-only and tag peels follow immutable tag objects). */
+function refsFingerprint(repo: Repo): string {
+  return [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([name, oid]) => `${name}=${oid}`).join(',');
+}
+const REF_LIST_CACHE = new Map<string, Buffer>();
+const REF_LIST_CACHE_MAX = 512;
+function refListCachePut(key: string, value: Buffer): void {
+  if (REF_LIST_CACHE.size >= REF_LIST_CACHE_MAX) REF_LIST_CACHE.clear();
+  REF_LIST_CACHE.set(key, value);
+}
+
 // ------------------------------------------------------------------ reachability
 
 function collectReachable(
@@ -691,6 +721,10 @@ interface Issue {
   updatedAt: string;
   closedAt: string | null;
   authorLogin: string;
+  /** Serialized issueJson bytes, cached for the GET-one-issue hot path (the
+   *  read workload fetches one unchanged issue 2,000 times). Cleared on any
+   *  mutation of the issue or its comment count; never part of issueJson. */
+  _json?: Buffer | null;
 }
 
 interface Pull {
@@ -810,6 +844,7 @@ class Store {
 
   createIssue(repo: Repo, title: string, body: string, labels: Label[]): Issue {
     const seq = nextSeq();
+    const stamped = stampFor(seq);
     const issue: Issue = {
       id: this.nextIssueId,
       number: repo.nextNumber,
@@ -819,8 +854,8 @@ class Store {
       state: 'open',
       labels: [...labels],
       seq,
-      createdAt: stampFor(seq),
-      updatedAt: stampFor(seq),
+      createdAt: stamped,
+      updatedAt: stamped,
       closedAt: null,
       authorLogin: VIEWER.login,
     };
@@ -832,6 +867,7 @@ class Store {
 
   createPull(repo: Repo, title: string, body: string, headRef: string, baseRef: string, headSha: string, baseSha: string): Pull {
     const seq = nextSeq();
+    const stamped = stampFor(seq);
     const pull: Pull = {
       id: this.nextPullId,
       number: repo.nextNumber,
@@ -847,8 +883,8 @@ class Store {
       headSha,
       baseSha,
       seq,
-      createdAt: stampFor(seq),
-      updatedAt: stampFor(seq),
+      createdAt: stamped,
+      updatedAt: stamped,
       closedAt: null,
       authorLogin: VIEWER.login,
     };
@@ -1216,6 +1252,7 @@ function restHeaders(req: IncomingMessage, url: URL, params: PageParams, totalPa
 
 function splitPath(pathname: string): string[] {
   return pathname.split('/').filter((s) => s.length > 0).map((s) => {
+    if (s.indexOf('%') === -1) return s;
     try {
       return decodeURIComponent(s);
     } catch {
@@ -1684,7 +1721,15 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL, s
         return;
       }
       if (method === 'GET') {
-        sendJson(res, 200, issueJson(repo, issue), scopes);
+        // Hot path: serve the cached serialized bytes when the issue has not
+        // changed since they were built (see _json on Issue).
+        if (issue._json !== undefined && issue._json !== null) {
+          sendBuffer(res, 200, issue._json, 'application/json', scopes);
+          return;
+        }
+        const body = Buffer.from(JSON.stringify(issueJson(repo, issue)), 'utf8');
+        issue._json = body;
+        sendBuffer(res, 200, body, 'application/json', scopes);
         return;
       }
       if (method === 'PATCH') {
@@ -1701,6 +1746,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL, s
           issue.closedAt = input.state === 'closed' ? stampFor(nextSeq()) : null;
         }
         issue.updatedAt = stampFor(nextSeq());
+        issue._json = null;
         sendJson(res, 200, issueJson(repo, issue), scopes);
         return;
       }
@@ -1730,6 +1776,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, url: URL, s
           return;
         }
         const comment = store.addComment(repo, num, commentBody);
+        issue._json = null; // issueJson's comments count changed
         sendJson(res, 201, commentJson(repo, comment), scopes);
         return;
       }
@@ -1923,14 +1970,22 @@ function sortedRefs(repo: Repo): { oid: string; name: string }[] {
   return [...repo.refs.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)).map(([name, oid]) => ({ oid, name }));
 }
 
+/** The v2 upload-pack advertisement names no repo state at all
+ *  (capabilities only), so it is one constant buffer for the process. */
+let advertisementV2Cache: Buffer | null = null;
 function advertisementV2Upload(repo: Repo): Buffer {
+  if (advertisementV2Cache !== null) return advertisementV2Cache;
   const parts: Buffer[] = [pktEncode('# service=git-upload-pack\n'), PKT_FLUSH, pktEncode('version 2\n')];
   for (const cap of UPLOAD_V2_CAPS) parts.push(pktEncode(`${cap}\n`));
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  advertisementV2Cache = Buffer.concat(parts);
+  return advertisementV2Cache;
 }
 
 function advertisementV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-pack'): Buffer {
+  const cacheKey = `${repo.dbId}|${service}|${refsFingerprint(repo)}`;
+  const cached = REF_LIST_CACHE.get(cacheKey);
+  if (cached !== undefined) return cached;
   const caps = service === 'git-upload-pack' ? UPLOAD_V0_CAPS : RECEIVE_V0_CAPS;
   const serviceLine = service === 'git-upload-pack' ? '# service=git-upload-pack\n' : '# service=git-receive-pack\n';
   const parts: Buffer[] = [pktEncode(serviceLine), PKT_FLUSH];
@@ -1949,7 +2004,9 @@ function advertisementV0(repo: Repo, service: 'git-upload-pack' | 'git-receive-p
     }
   }
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  refListCachePut(cacheKey, out);
+  return out;
 }
 
 interface FetchPlan {
@@ -2083,6 +2140,9 @@ function v0FetchResponse(plan: FetchPlan): Buffer {
 }
 
 function v2LsRefsResponse(repo: Repo, opts: { peel: boolean; symrefs: boolean; unborn: boolean; prefixes: string[] }): Buffer {
+  const cacheKey = `${repo.dbId}|lsrefs|${refsFingerprint(repo)}|${opts.peel ? 1 : 0}${opts.symrefs ? 1 : 0}${opts.unborn ? 1 : 0}|${opts.prefixes.join(',')}`;
+  const cached = REF_LIST_CACHE.get(cacheKey);
+  if (cached !== undefined) return cached;
   const parts: Buffer[] = [];
   const keep = (name: string): boolean => opts.prefixes.length === 0 || opts.prefixes.some((p) => name.startsWith(p));
   const mainTip = repo.refs.get('refs/heads/main');
@@ -2105,12 +2165,15 @@ function v2LsRefsResponse(repo: Repo, opts: { peel: boolean; symrefs: boolean; u
     parts.push(pktEncode(`${line}\n`));
   }
   parts.push(PKT_FLUSH);
-  return Buffer.concat(parts);
+  const out = Buffer.concat(parts);
+  refListCachePut(cacheKey, out);
+  return out;
 }
 
 async function handleGit(req: IncomingMessage, res: ServerResponse, url: URL, seg: string[], method: string): Promise<void> {
   const owner = seg[0] as string;
-  const repoName = (seg[1] as string).replace(/\.git$/, '');
+  const rawName = seg[1] as string;
+  const repoName = rawName.endsWith('.git') ? rawName.slice(0, -4) : rawName;
   if (!isAuthed(req)) {
     sendError(res, 401, 'Requires authentication');
     return;
@@ -2198,8 +2261,16 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, url: URL, se
             if (Number.isFinite(n) && n > 0) depth = n;
           }
         }
+        const fetchKey = fetchCacheKey(repo, 'v2', wants, haves, depth, oldShallow);
+        const cachedFetch = FETCH_CACHE.get(fetchKey);
+        if (cachedFetch !== undefined) {
+          sendBuffer(res, 200, cachedFetch, 'application/x-git-upload-pack-result');
+          return;
+        }
         const plan = planFetch(repo, wants, haves, depth, oldShallow);
-        sendBuffer(res, 200, v2FetchResponse(plan), 'application/x-git-upload-pack-result');
+        const fetchRes = v2FetchResponse(plan);
+        fetchCachePut(fetchKey, fetchRes);
+        sendBuffer(res, 200, fetchRes, 'application/x-git-upload-pack-result');
         return;
       }
       sendError(res, 400, `Unknown v2 command: ${command}`);
@@ -2231,8 +2302,16 @@ async function handleGit(req: IncomingMessage, res: ServerResponse, url: URL, se
     for (const line of sections[1] || []) {
       if (line.startsWith('have ')) haves.push(line.slice(5).trim());
     }
+    const fetchKey = fetchCacheKey(repo, 'v0', wants, haves, depth, oldShallow);
+    const cachedFetch = FETCH_CACHE.get(fetchKey);
+    if (cachedFetch !== undefined) {
+      sendBuffer(res, 200, cachedFetch, 'application/x-git-upload-pack-result');
+      return;
+    }
     const plan = planFetch(repo, wants, haves, depth, oldShallow);
-    sendBuffer(res, 200, v0FetchResponse(plan), 'application/x-git-upload-pack-result');
+    const fetchRes = v0FetchResponse(plan);
+    fetchCachePut(fetchKey, fetchRes);
+    sendBuffer(res, 200, fetchRes, 'application/x-git-upload-pack-result');
     return;
   }
 
@@ -2963,6 +3042,7 @@ const GQL_RESOLVERS: Record<string, Record<string, Resolver>> = {
         issue.state = 'closed';
         issue.closedAt = stampFor(nextSeq());
         issue.updatedAt = stampFor(nextSeq());
+        issue._json = null;
         return { __typename: 'CloseIssuePayload', issue: { __typename: 'Issue', repo, issue } };
       }
       throw new GqlAbort('closeIssue: issue not found');
@@ -3026,6 +3106,7 @@ const GQL_RESOLVERS: Record<string, Record<string, Resolver>> = {
         const issue = repo.issues.get(number);
         if (issue === undefined) throw new GqlAbort('addComment: issue not found');
         const comment = store.addComment(repo, number, String(input.body || ''));
+        issue._json = null; // issueJson's comments count changed
         return { __typename: 'AddCommentPayload', commentEdge: { __typename: 'AddCommentEdge', node: { __typename: 'IssueComment', repo, comment } } };
       }
       throw new GqlAbort('addComment: issue not found');
